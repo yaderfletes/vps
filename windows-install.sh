@@ -1,125 +1,191 @@
 #!/bin/bash
 
-# ============================================
-# VERIFICACIÓN DE ENTORNO
-# ============================================
+echo "=========================================="
+echo "VERIFICANDO ENTORNO"
+echo "=========================================="
+
+# 1. Verificar que NO estamos en entorno overlay
 
 
-# ============================================
-# ACTUALIZACIÓN E INSTALACIÓN DE PAQUETES
-# ============================================
+# 2. Instalar paquetes necesarios (con manejo de errores)
+echo "Instalando dependencias..."
 apt update -y && apt upgrade -y
-apt install grub2 wimtools ntfs-3g gdisk parted wimlib-imagex rsync -y
 
-# ============================================
-# CÁLCULO DEL TAMAÑO DEL DISCO (MÉTODO SEGURO)
-# ============================================
-disk_size_bytes=$(blockdev --getsize64 /dev/sda)
-disk_size_mb=$((disk_size_bytes / 1024 / 1024))
+# Intentar diferentes nombres de paquete para wimlib
+apt install -y grub2 wimtools ntfs-3g gdisk parted rsync || \
+apt install -y grub2 wimutils ntfs-3g gdisk parted rsync || \
+apt install -y grub2 ntfs-3g gdisk parted rsync
 
-if [ $disk_size_mb -lt 10000 ]; then
-    echo "ERROR: Disco demasiado pequeño o no detectado correctamente"
-    exit 1
+# Instalar wimlib-imagex desde fuente si no existe
+if ! command -v wimlib-imagex &> /dev/null; then
+    echo "wimlib-imagex no encontrado, instalando desde fuente..."
+    apt install -y git build-essential libxml2-dev libssl-dev
+    cd /tmp
+    git clone https://github.com/msys2/wimlib.git
+    cd wimlib
+    ./configure --prefix=/usr
+    make && make install
+    cd /
 fi
 
-# Calcular 25% del disco para cada partición
+# 3. LIMPIAR EL DISCO COMPLETAMENTE (IMPORTANTE)
+echo "=========================================="
+echo "LIMPIANDO DISCO /dev/sda"
+echo "=========================================="
+
+# Desmontar todo lo que esté montado en /dev/sda
+umount /dev/sda* 2>/dev/null
+swapoff /dev/sda* 2>/dev/null
+
+# Limpiar los primeros y últimos sectores del disco
+dd if=/dev/zero of=/dev/sda bs=512 count=10000 status=progress
+dd if=/dev/zero of=/dev/sda bs=512 seek=$(($(blockdev --getsz /dev/sda) - 10000)) count=10000 status=progress
+
+# Crear tabla GPT limpia
+sgdisk -Z /dev/sda           # Cero la tabla actual (ZAP)
+sgdisk -o /dev/sda           # Nueva tabla GUID
+partprobe /dev/sda
+sleep 3
+
+# 4. CÁLCULO DEL TAMAÑO
+disk_size_bytes=$(blockdev --getsize64 /dev/sda)
+disk_size_mb=$((disk_size_bytes / 1024 / 1024))
 part_size_mb=$((disk_size_mb / 4))
 
 echo "Tamaño del disco: ${disk_size_mb}MB"
 echo "Tamaño de cada partición: ${part_size_mb}MB"
 
-# ============================================
-# CREACIÓN DE PARTICIONES (UNA SOLA VEZ)
-# ============================================
-sgdisk -o /dev/sda                    # Limpia tabla anterior
-sgdisk -n 1:2048:+${part_size_mb}MB -t 1:0700 /dev/sda
-sgdisk -n 2:0:+${part_size_mb}MB -t 2:0700 /dev/sda
+# 5. CREAR PARTICIONES
+echo "=========================================="
+echo "CREANDO PARTICIONES"
+echo "=========================================="
+
+# Usar sgdisk con fuerza (-g)
+sgdisk -n 1:2048:+${part_size_mb}MB -t 1:0700 -c 1:"Windows_System" /dev/sda
+sgdisk -n 2:0:+${part_size_mb}MB -t 2:0700 -c 2:"Windows_Data" /dev/sda
+
+# Verificar que las particiones existen
+if ! sgdisk -p /dev/sda | grep -q "/dev/sda1"; then
+    echo "ERROR: No se pudo crear /dev/sda1"
+    sgdisk -p /dev/sda
+    exit 1
+fi
 
 partprobe /dev/sda
 sleep 5
 
-# ============================================
-# FORMATEO NTFS
-# ============================================
-mkfs.ntfs -Q -f /dev/sda1
-mkfs.ntfs -Q -f /dev/sda2
+# 6. FORMATEAR NTFS
+echo "=========================================="
+echo "FORMATEANDO PARTICIONES"
+echo "=========================================="
 
-# ============================================
-# MONTAJE DE PARTICIONES
-# ============================================
+# Asegurar que no están montadas
+umount /dev/sda1 2>/dev/null
+umount /dev/sda2 2>/dev/null
+
+# Formatear
+mkfs.ntfs -Q -f /dev/sda1 -L "Windows_System"
+mkfs.ntfs -Q -f /dev/sda2 -L "Windows_Data"
+
+# 7. MONTAR PARTICIONES
+echo "=========================================="
+echo "MONTANDO PARTICIONES"
+echo "=========================================="
+
 mkdir -p /mnt
-mount /dev/sda1 /mnt || { echo "ERROR montando /dev/sda1"; exit 1; }
+mount /dev/sda1 /mnt
+if [ $? -ne 0 ]; then
+    echo "ERROR montando /dev/sda1"
+    exit 1
+fi
 
 mkdir -p /root/windisk
-mount /dev/sda2 /root/windisk || { echo "ERROR montando /dev/sda2"; exit 1; }
+mount /dev/sda2 /root/windisk
+if [ $? -ne 0 ]; then
+    echo "ERROR montando /dev/sda2"
+    exit 1
+fi
 
-# ============================================
-# INSTALACIÓN DE GRUB
-# ============================================
+echo "Particiones montadas exitosamente"
+
+# 8. INSTALAR GRUB
+echo "=========================================="
+echo "INSTALANDO GRUB"
+echo "=========================================="
+
+mkdir -p /mnt/boot/grub
 grub-install --target=i386-pc --recheck --force --root-directory=/mnt /dev/sda
 
-# Configuración de GRUB
-mkdir -p /mnt/boot/grub
+# Configuración GRUB
 cat > /mnt/boot/grub/grub.cfg << 'EOF'
-menuentry "Windows Installer" {
+set timeout=10
+set default=0
+
+menuentry "Instalar Windows Server 2022" {
     insmod ntfs
     insmod part_gpt
-    search --set=root --file=/bootmgr
+    search --set=root --file=/sources/setup.exe
     ntldr /bootmgr
+    boot
+}
+
+menuentry "Instalar Windows (modo seguro)" {
+    insmod ntfs
+    insmod part_gpt
+    set root=(hd0,1)
+    chainloader +1
     boot
 }
 EOF
 
-# ============================================
-# DESCARGA DE WINDOWS ISO
-# ============================================
+# 9. CONTINUAR CON EL RESTO (WINDOWS ISO + VIRTIO)
 cd /root/windisk
 
-wget -O win10.iso --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-    "https://bit.ly/4aCjkM2"
+echo "Descargando Windows ISO..."
+wget -O win10.iso --user-agent="Mozilla/5.0" "https://bit.ly/4aCjkM2"
 
-# ============================================
-# MONTAJE Y COPIA DE WINDOWS
-# ============================================
 mkdir -p winfile
 mount -o loop win10.iso winfile
 
+echo "Copiando archivos de Windows..."
 rsync -avz --progress winfile/* /mnt/
 
 umount winfile
 
-# ============================================
-# DESCARGA Y COPIADO DE VIRTIO DRIVERS
-# ============================================
-wget -O virtio.iso --user-agent="Mozilla/5.0" \
-    "https://bit.ly/4d1g7Ht"
+echo "Descargando VirtIO ISO..."
+wget -O virtio.iso --user-agent="Mozilla/5.0" "https://bit.ly/4d1g7Ht"
 
 mkdir -p virtio_mount
 mount -o loop virtio.iso virtio_mount
 
-# Crear directorio para VirtIO dentro de la instalación de Windows
 mkdir -p /mnt/sources/virtio
 
-# Copiar drivers VirtIO
+echo "Copiando drivers VirtIO..."
 rsync -avz --progress virtio_mount/* /mnt/sources/virtio/
 
 umount virtio_mount
 
-# ============================================
-# INTEGRACIÓN DE VIRTIO EN BOOT.WIM
-# ============================================
+# 10. INTEGRAR VIRTIO EN BOOT.WIM
 cd /mnt/sources
 
-# Crear archivo de comandos para wimlib-imagex
-cat > cmd.txt << 'EOF'
+if [ -f boot.wim ]; then
+    echo "Integrando VirtIO en boot.wim..."
+    cat > cmd.txt << 'EOF'
 add virtio /virtio_drivers
 EOF
-
-# Aplicar la integración al boot.wim (índice 2)
-wimlib-imagex update boot.wim 2 < cmd.txt
+    wimlib-imagex update boot.wim 2 < cmd.txt
+    echo "VirtIO integrado exitosamente"
+else
+    echo "ADVERTENCIA: boot.wim no encontrado"
+    echo "Los drivers VirtIO están en /sources/virtio/"
+fi
 
 echo "=========================================="
-echo "SCRIPT COMPLETADO CON ÉXITO"
-echo "Los drivers VirtIO han sido integrados"
+echo "¡PROCESO COMPLETADO CON ÉXITO!"
 echo "=========================================="
-echo "Ejecuta 'reboot' para reiniciar e iniciar la instalación de Windows"
+echo ""
+echo "Ahora puedes:"
+echo "1. Ejecutar 'reboot' para reiniciar"
+echo "2. Arrancar desde /dev/sda"
+echo "3. Los drivers VirtIO estarán disponibles"
+echo ""
