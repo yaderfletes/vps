@@ -3,11 +3,7 @@
 # ============================================
 # VERIFICACIÓN DE ENTORNO
 # ============================================
-if mount | grep -q "overlay"; then
-    echo "ERROR: Este script NO puede ejecutarse desde un Live USB o entorno overlay."
-    echo "Debes ejecutarlo desde un sistema Linux instalado en el disco."
-    exit 1
-fi
+
 
 # ============================================
 # ACTUALIZACIÓN E INSTALACIÓN DE PAQUETES
